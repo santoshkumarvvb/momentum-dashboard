@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,62 +7,80 @@ from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="Global Stage 2 Momentum", page_icon="📈", layout="wide")
 st.title("📈 Global Stage 2 Momentum Dashboard")
-st.caption("India + S&P 500 + Nasdaq-100 • Yahoo Finance • Stage 2")
+st.caption("Market prices/history: Yahoo Finance • Stage 2 / EMA / RSI / 52-week high")
 
 with st.sidebar:
-    market = st.selectbox("Universe", ["India Watchlist", "S&P 500", "Nasdaq-100", "USA Combined"])
-    refresh_minutes = st.selectbox("Auto refresh", [5,10,15,30,60], index=2)
-    st_autorefresh(interval=refresh_minutes*60*1000, key="refresh")
+    st.header("Market")
+    market = st.selectbox(
+        "Universe",
+        ["India Watchlist", "S&P 500", "Nasdaq-100", "USA Combined"]
+    )
+    refresh_minutes = st.selectbox("Auto refresh", [5, 10, 15, 30, 60], index=2)
+    st_autorefresh(interval=refresh_minutes * 60 * 1000, key="refresh")
+
+    st.header("Filters")
     only_stage2 = st.checkbox("Stage 2 only", False)
-    only_near_high = st.checkbox("Within 5% of 52W high only", False)
-
-@st.cache_data(ttl=86400)
-def load_sp500():
-    t = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-    df = pd.DataFrame({
-        "Ticker": t["Symbol"].astype(str).str.replace(".", "-", regex=False),
-        "Company": t["Security"].astype(str),
-        "Sector": t["GICS Sector"].astype(str)
-    })
-    return df
-
-@st.cache_data(ttl=86400)
-def load_nasdaq100():
-    tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
-    for t in tables:
-        cols = [str(c) for c in t.columns]
-        if "Ticker" in cols and ("Company" in cols or "Company name" in cols):
-            ticker_col = "Ticker"
-            company_col = "Company" if "Company" in cols else "Company name"
-            sector_col = next((c for c in t.columns if "Sector" in str(c)), None)
-            return pd.DataFrame({
-                "Ticker": t[ticker_col].astype(str).str.replace(".", "-", regex=False),
-                "Company": t[company_col].astype(str),
-                "Sector": t[sector_col].astype(str) if sector_col is not None else ""
-            })
-    raise RuntimeError("Nasdaq-100 table not found")
+    only_25 = st.checkbox("Within 25% of 52W high", False)
+    only_5 = st.checkbox("Within 5% of 52W high", False)
+    only_2 = st.checkbox("Within 2% of 52W high", False)
 
 @st.cache_data(ttl=86400)
 def load_india():
-    return pd.read_csv("tickers.csv")[["Ticker","Company","Sector"]]
+    df = pd.read_csv("tickers.csv")
+    keep = ["Ticker", "Company", "Sector"]
+    for col in keep:
+        if col not in df.columns:
+            df[col] = ""
+    return df[keep].dropna(subset=["Ticker"])
 
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_one(ticker):
-    hist = yf.download(ticker, period="18mo", interval="1d", auto_adjust=False, progress=False, threads=False)
+@st.cache_data(ttl=86400)
+def load_sp500():
+    raw = pd.read_csv("sp500.csv")
+    return pd.DataFrame({
+        "Ticker": raw["Symbol"].astype(str).str.replace(".", "-", regex=False),
+        "Company": raw["Security"].astype(str),
+        "Sector": raw["GICS Sector"].astype(str)
+    })
+
+@st.cache_data(ttl=86400)
+def load_nasdaq100():
+    raw = pd.read_csv("nasdaq100.csv")
+    return pd.DataFrame({
+        "Ticker": raw["Ticker"].astype(str).str.replace(".", "-", regex=False),
+        "Company": raw["Company"].astype(str),
+        "Sector": raw["GICS_Sector"].astype(str)
+    })
+
+def get_universe(name):
+    if name == "India Watchlist":
+        return load_india()
+    if name == "S&P 500":
+        return load_sp500()
+    if name == "Nasdaq-100":
+        return load_nasdaq100()
+    return (
+        pd.concat([load_sp500(), load_nasdaq100()], ignore_index=True)
+        .drop_duplicates(subset=["Ticker"])
+        .reset_index(drop=True)
+    )
+
+def calculate_one(hist, ticker):
     if hist is None or hist.empty:
-        return None, None
-    if isinstance(hist.columns, pd.MultiIndex):
-        hist.columns = hist.columns.get_level_values(0)
-    hist = hist.dropna(subset=["Close"]).copy()
+        return None
+    hist = hist.copy()
+    needed = ["Close", "High", "Low", "Volume"]
+    if not all(c in hist.columns for c in needed):
+        return None
+    hist = hist.dropna(subset=["Close"])
     if len(hist) < 220:
-        return None, hist
+        return None
 
-    close = hist["Close"].astype(float)
-    high = hist["High"].astype(float)
-    low = hist["Low"].astype(float)
-    vol = hist["Volume"].astype(float)
+    close = pd.to_numeric(hist["Close"], errors="coerce")
+    high = pd.to_numeric(hist["High"], errors="coerce")
+    low = pd.to_numeric(hist["Low"], errors="coerce")
+    volume = pd.to_numeric(hist["Volume"], errors="coerce")
 
-    for n in [20,50,150,200]:
+    for n in [20, 50, 150, 200]:
         hist[f"EMA{n}"] = close.ewm(span=n, adjust=False).mean()
 
     delta = close.diff()
@@ -70,93 +89,237 @@ def fetch_one(ticker):
     avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    hist["RSI14"] = 100 - (100/(1+rs))
-    hist["AvgVol20"] = vol.rolling(20).mean()
-    hist["RelVol"] = vol / hist["AvgVol20"]
+    hist["RSI14"] = 100 - (100 / (1 + rs))
 
-    r = hist.iloc[-1]
-    c = float(r["Close"]); e20=float(r["EMA20"]); e50=float(r["EMA50"]); e150=float(r["EMA150"]); e200=float(r["EMA200"])
-    e200_old = float(hist["EMA200"].iloc[-21])
-    h52 = float(high.tail(252).max()); l52=float(low.tail(252).min())
-    dist = (c/h52 - 1)*100
-    rsi=float(r["RSI14"]); relvol=float(r["RelVol"])
+    hist["AvgVol20"] = volume.rolling(20).mean()
+    hist["RelVol"] = volume / hist["AvgVol20"]
 
-    stage2 = c>e50 and e50>e150 and e150>e200 and e200>e200_old and c>=1.30*l52 and c>=0.75*h52
-    ema_stack = e20>e50>e150>e200
-    within2 = dist>=-2
-    within5 = dist>=-5
-    fresh_high = c>=h52*0.999
-    volume_breakout = relvol>=1.5
+    row = hist.iloc[-1]
+    c = float(row["Close"])
+    e20 = float(row["EMA20"])
+    e50 = float(row["EMA50"])
+    e150 = float(row["EMA150"])
+    e200 = float(row["EMA200"])
+    e200_20ago = float(hist["EMA200"].iloc[-21])
 
-    score = (30 if stage2 else 0)+(20 if ema_stack else 0)+(20 if within2 else (10 if within5 else 0))+(15 if volume_breakout else 0)+(10 if 60<=rsi<=75 else (5 if 55<=rsi<80 else 0))
-    action = "BUY" if stage2 and ema_stack and within2 and volume_breakout else ("WATCH" if stage2 and within5 else "AVOID")
+    h52 = float(high.tail(252).max())
+    l52 = float(low.tail(252).min())
+    dist_high = (c / h52 - 1) * 100
+
+    rsi = float(row["RSI14"]) if pd.notna(row["RSI14"]) else np.nan
+    relvol = float(row["RelVol"]) if pd.notna(row["RelVol"]) else np.nan
+
+    # Stage 2 / Minervini-style trend template.
+    stage2 = (
+        c > e50
+        and e50 > e150
+        and e150 > e200
+        and e200 > e200_20ago
+        and c >= 1.30 * l52
+        and c >= 0.75 * h52
+    )
+
+    ema_stack = e20 > e50 > e150 > e200
+    within25 = dist_high >= -25
+    within5 = dist_high >= -5
+    within2 = dist_high >= -2
+    fresh_high = c >= h52 * 0.999
+    volume_breakout = bool(pd.notna(relvol) and relvol >= 1.5)
+
+    score = 0
+    score += 30 if stage2 else 0
+    score += 20 if ema_stack else 0
+    score += 20 if within2 else (10 if within5 else (5 if within25 else 0))
+    score += 15 if volume_breakout else 0
+    score += 10 if pd.notna(rsi) and 60 <= rsi <= 75 else (
+        5 if pd.notna(rsi) and 55 <= rsi < 80 else 0
+    )
+
+    if stage2 and ema_stack and within2 and volume_breakout:
+        action = "BUY"
+    elif stage2 and within5:
+        action = "WATCH"
+    elif stage2 and within25:
+        action = "STAGE 2"
+    else:
+        action = "AVOID"
 
     return {
-        "Ticker":ticker,"Price":c,"EMA20":e20,"EMA50":e50,"EMA150":e150,"EMA200":e200,
-        "EMA Stack":ema_stack,"EMA200 Rising":e200>e200_old,"52W High":h52,"% From 52W High":dist,
-        "RSI14":rsi,"Rel Volume":relvol,"Stage 2":stage2,"Within 2%":within2,"Within 5%":within5,
-        "Fresh 52W High":fresh_high,"Volume Breakout":volume_breakout,"Momentum Score":score,"Action":action
+        "Ticker": ticker,
+        "Price": c,
+        "EMA20": e20,
+        "EMA50": e50,
+        "EMA150": e150,
+        "EMA200": e200,
+        "EMA Stack": ema_stack,
+        "EMA200 Rising": e200 > e200_20ago,
+        "52W High": h52,
+        "% From 52W High": dist_high,
+        "Within 25%": within25,
+        "Within 5%": within5,
+        "Within 2%": within2,
+        "Fresh 52W High": fresh_high,
+        "RSI14": rsi,
+        "Rel Volume": relvol,
+        "Volume Breakout": volume_breakout,
+        "Stage 2": stage2,
+        "Momentum Score": score,
+        "Action": action,
     }, hist
 
-if market == "India Watchlist":
-    universe = load_india()
-elif market == "S&P 500":
-    universe = load_sp500()
-elif market == "Nasdaq-100":
-    universe = load_nasdaq100()
-else:
-    universe = pd.concat([load_sp500(), load_nasdaq100()], ignore_index=True).drop_duplicates("Ticker")
+@st.cache_data(ttl=900, show_spinner=False)
+def yahoo_batch_download(tickers_tuple):
+    tickers = list(tickers_tuple)
+    if not tickers:
+        return {}
+    result = {}
+    batch_size = 40
+    for start in range(0, len(tickers), batch_size):
+        batch = tickers[start:start + batch_size]
+        try:
+            data = yf.download(
+                tickers=batch,
+                period="18mo",
+                interval="1d",
+                auto_adjust=False,
+                group_by="ticker",
+                threads=True,
+                progress=False,
+            )
+        except Exception:
+            continue
+
+        if data is None or data.empty:
+            continue
+
+        if len(batch) == 1:
+            result[batch[0]] = data
+            continue
+
+        # group_by="ticker" normally gives ticker as the first MultiIndex level.
+        if isinstance(data.columns, pd.MultiIndex):
+            level0 = set(map(str, data.columns.get_level_values(0)))
+            for ticker in batch:
+                try:
+                    if ticker in level0:
+                        sub = data[ticker].copy()
+                    else:
+                        # Fallback for reversed MultiIndex shape.
+                        sub = data.xs(ticker, axis=1, level=1).copy()
+                    result[ticker] = sub
+                except Exception:
+                    pass
+    return result
+
+universe = get_universe(market)
+universe["Ticker"] = universe["Ticker"].astype(str).str.strip()
+universe = universe[universe["Ticker"] != ""].drop_duplicates("Ticker").reset_index(drop=True)
 
 st.write(f"**Universe:** {market} — {len(universe)} symbols")
+st.info("All price, high, low and volume history used below is downloaded from Yahoo Finance.")
 
-records=[]; histories={}
-with st.spinner("Loading market data..."):
-    progress=st.progress(0)
-    total=max(len(universe),1)
-    for i,(_,u) in enumerate(universe.iterrows(),start=1):
-        ticker=str(u["Ticker"]).strip()
-        try:
-            rec,hist=fetch_one(ticker)
-            if rec:
-                rec["Company"]=u.get("Company",ticker)
-                rec["Sector"]=u.get("Sector","")
-                records.append(rec); histories[ticker]=hist
-        except Exception:
-            pass
-        progress.progress(i/total)
-    progress.empty()
+with st.spinner("Downloading Yahoo Finance history and calculating signals..."):
+    history_map = yahoo_batch_download(tuple(universe["Ticker"].tolist()))
+    records = []
+    chart_history = {}
+    for _, row in universe.iterrows():
+        ticker = row["Ticker"]
+        hist = history_map.get(ticker)
+        calc = calculate_one(hist, ticker)
+        if calc is None:
+            continue
+        rec, processed_hist = calc
+        rec["Company"] = row.get("Company", "")
+        rec["Sector"] = row.get("Sector", "")
+        records.append(rec)
+        chart_history[ticker] = processed_hist
 
 if not records:
-    st.error("No market data loaded.")
+    st.error("Yahoo Finance returned no usable history. Try Refresh later.")
     st.stop()
 
-df=pd.DataFrame(records)
-if only_stage2: df=df[df["Stage 2"]]
-if only_near_high: df=df[df["Within 5%"]]
-df=df.sort_values(["Momentum Score","% From 52W High"],ascending=[False,False])
+df = pd.DataFrame(records)
+all_df = df.copy()
 
-c1,c2,c3,c4=st.columns(4)
-allr=pd.DataFrame(records)
-c1.metric("Stocks scanned",len(records))
-c2.metric("Stage 2",int(allr["Stage 2"].sum()))
-c3.metric("Within 2%",int(allr["Within 2%"].sum()))
-c4.metric("BUY signals",int((allr["Action"]=="BUY").sum()))
+if only_stage2:
+    df = df[df["Stage 2"]]
+if only_25:
+    df = df[df["Within 25%"]]
+if only_5:
+    df = df[df["Within 5%"]]
+if only_2:
+    df = df[df["Within 2%"]]
 
-show=df[["Ticker","Company","Sector","Price","Momentum Score","Action","Stage 2","EMA Stack","% From 52W High","RSI14","Rel Volume","Fresh 52W High"]].copy()
-for c in ["Price","% From 52W High","RSI14","Rel Volume"]:
-    show[c]=pd.to_numeric(show[c],errors="coerce").round(2)
+df = df.sort_values(
+    ["Momentum Score", "% From 52W High"],
+    ascending=[False, False]
+).reset_index(drop=True)
 
-st.dataframe(show,use_container_width=True,hide_index=True)
-st.download_button("Download ranking CSV",df.to_csv(index=False).encode("utf-8"),"momentum_ranking.csv","text/csv")
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Scanned", len(all_df))
+c2.metric("Stage 2", int(all_df["Stage 2"].sum()))
+c3.metric("Within 25%", int(all_df["Within 25%"].sum()))
+c4.metric("Within 2%", int(all_df["Within 2%"].sum()))
+c5.metric("BUY", int((all_df["Action"] == "BUY").sum()))
 
-if len(df):
-    selected=st.selectbox("Stock detail",df["Ticker"].tolist())
-    row=df[df["Ticker"]==selected].iloc[0]
-    a,b,c,d=st.columns(4)
-    a.metric("Price",f"{row['Price']:.2f}")
-    b.metric("Score",f"{int(row['Momentum Score'])}/100")
-    c.metric("% from 52W high",f"{row['% From 52W High']:.2f}%")
-    d.metric("RSI",f"{row['RSI14']:.1f}")
-    st.line_chart(histories[selected].tail(180)[["Close","EMA20","EMA50","EMA200"]],use_container_width=True)
+st.subheader("🔥 Momentum Ranking")
 
-st.caption("Educational screening tool only; not investment advice.")
+cols = [
+    "Ticker", "Company", "Sector", "Price", "Momentum Score", "Action",
+    "Stage 2", "EMA20", "EMA50", "EMA150", "EMA200",
+    "% From 52W High", "RSI14", "Rel Volume", "Fresh 52W High"
+]
+show = df[cols].copy()
+
+for col in ["Price", "EMA20", "EMA50", "EMA150", "EMA200",
+            "% From 52W High", "RSI14", "Rel Volume"]:
+    show[col] = pd.to_numeric(show[col], errors="coerce").round(2)
+
+st.dataframe(
+    show,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Momentum Score": st.column_config.ProgressColumn(
+            "Score", min_value=0, max_value=100
+        ),
+        "Stage 2": st.column_config.CheckboxColumn("Stage 2"),
+        "Fresh 52W High": st.column_config.CheckboxColumn("Fresh 52W High"),
+        "% From 52W High": st.column_config.NumberColumn(
+            "% from 52W High", format="%.2f%%"
+        ),
+    },
+)
+
+st.download_button(
+    "Download current ranking",
+    data=df.to_csv(index=False).encode("utf-8"),
+    file_name=f"{market.replace(' ', '_')}_momentum.csv",
+    mime="text/csv",
+)
+
+if not df.empty:
+    st.subheader("📊 Stock Detail")
+    selected = st.selectbox("Select stock", df["Ticker"].tolist())
+    sr = df[df["Ticker"] == selected].iloc[0]
+
+    a, b, c, d = st.columns(4)
+    a.metric("Price", f"{sr['Price']:.2f}")
+    b.metric("Momentum Score", f"{int(sr['Momentum Score'])}/100")
+    c.metric("% from 52W high", f"{sr['% From 52W High']:.2f}%")
+    d.metric("RSI(14)", f"{sr['RSI14']:.1f}")
+
+    hist = chart_history[selected].tail(180)
+    st.line_chart(hist[["Close", "EMA20", "EMA50", "EMA200"]], use_container_width=True)
+
+    st.write(
+        f"**Signal:** {sr['Action']} | "
+        f"**Stage 2:** {'Yes' if sr['Stage 2'] else 'No'} | "
+        f"**Relative volume:** {sr['Rel Volume']:.2f}×"
+    )
+
+st.caption(
+    "Index CSV files define which symbols are scanned. Market prices/history and "
+    "all technical calculations are based on Yahoo Finance data. "
+    "Educational screening tool only; not investment advice."
+)
