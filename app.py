@@ -18,6 +18,7 @@ with st.sidebar:
     st.caption("Data refreshes when you reload the page or change a setting.")
     if st.button("🔄 Refresh market data",use_container_width=True): st.cache_data.clear(); st.rerun()
     only_stage2=st.checkbox("Stage 2 only",False)
+    st.caption("Stage 2 uses your SMA50/150/200 template, rising SMA200 over 20 OR 80 OR 100 sessions, weekly 52-week extremes, price >10 and price × average 50-day volume >1,000,000. Global markets use their quoted price units.")
     high_filter=st.selectbox("52-week-high filter",["All","Within 25%","Within 10%","Within 5%","Within 2%"])
     min_rsi=st.slider("Minimum RSI(14)",0,80,0,5)
     min_relvol=st.select_slider("Minimum relative volume",options=[0.0,.75,1.0,1.25,1.5,2.0],value=0.0)
@@ -69,6 +70,35 @@ def benchmark_returns(ticker):
         return {63:period_return(c,63),126:period_return(c,126),252:period_return(c,252)}
     except Exception:return {63:np.nan,126:np.nan,252:np.nan}
 
+
+def chartink_stage2(h):
+    """User's cash Stage-2 template; Friday weeks include the current partial week."""
+    close = h["Close"].astype(float)
+    sma = {n: close.rolling(n).mean() for n in (50, 150, 200)}
+    weekly = h[["High", "Low"]].resample("W-FRI").agg({"High": "max", "Low": "min"}).dropna()
+    weekly = weekly.tail(52)
+    row = h.iloc[-1]
+    p = float(row["Close"])
+    s50, s150, s200 = (float(sma[n].iloc[-1]) for n in (50, 150, 200))
+    rising = any(
+        len(h) > offset and pd.notna(sma[200].iloc[-offset-1])
+        and s200 > float(sma[200].iloc[-offset-1])
+        for offset in (20, 80, 100)
+    )
+    hi = float(weekly["High"].max())
+    lo = float(weekly["Low"].min())
+    avgvol50 = float(h["Volume"].astype(float).rolling(50).mean().iloc[-1])
+    ready = len(weekly) == 52 and all(pd.notna(v) for v in (s50, s150, s200, avgvol50))
+    passed = bool(ready and p > s50 > s150 > s200 and rising
+                  and float(row["Low"]) >= 1.5 * lo
+                  and float(row["High"]) >= 0.75 * hi
+                  and p > 10 and p * avgvol50 > 1000000
+                  and float(row["Volume"]) > 0)
+    return {"Stage 2": passed, "SMA50": s50, "SMA150": s150, "SMA200": s200,
+            "SMA200 Rising": bool(rising), "Stage 2 Weekly High": hi,
+            "Stage 2 Weekly Low": lo, "Avg Volume 50": avgvol50,
+            "Stage 2 History Ready": bool(ready)}
+
 @st.cache_data(ttl=900,show_spinner=False)
 def fetch_one(ticker):
     h=yf.download(ticker,period="18mo",interval="1d",auto_adjust=False,progress=False,threads=False)
@@ -78,11 +108,12 @@ def fetch_one(ticker):
     if len(h)<220:return None,h
     close,high,low,vol=[h[c].astype(float) for c in ["Close","High","Low","Volume"]]
     for n in [20,50,100,150,200]:h[f"EMA{n}"]=close.ewm(span=n,adjust=False).mean()
+    for n in [50,150,200]:h[f"SMA{n}"]=close.rolling(n).mean()
     d=close.diff();g=d.clip(lower=0);l=-d.clip(upper=0);ag=g.ewm(alpha=1/14,min_periods=14,adjust=False).mean();al=l.ewm(alpha=1/14,min_periods=14,adjust=False).mean();rs=ag/al.replace(0,np.nan);h["RSI14"]=100-(100/(1+rs));h["AvgVol20"]=vol.rolling(20).mean();h["RelVol"]=vol/h["AvgVol20"]
     row=h.iloc[-1];p=float(row["Close"]);e20,e50,e100,e150,e200=[float(row[f"EMA{n}"]) for n in [20,50,100,150,200]];old=float(h["EMA200"].iloc[-21]);hi=float(high.tail(252).max());lo=float(low.tail(252).min());dist=(p/hi-1)*100;rsi=float(row["RSI14"]) if pd.notna(row["RSI14"]) else np.nan;rv=float(row["RelVol"]) if pd.notna(row["RelVol"]) else np.nan
     r3,r6,r12=period_return(close,63),period_return(close,126),period_return(close,252)
-    stage=p>e50>e150>e200 and e200>old and p>=1.30*lo and p>=.75*hi;stack=e20>e50>e100>e200;w25,w10,w5,w2=dist>=-25,dist>=-10,dist>=-5,dist>=-2;fresh=p>=hi*.999;vb=bool(pd.notna(rv) and rv>=1.5)
-    return {"Ticker":ticker,"Price":p,"EMA20":e20,"EMA50":e50,"EMA100":e100,"EMA150":e150,"EMA200":e200,"EMA Stack":stack,"EMA200 Rising":e200>old,"52W High":hi,"% From 52W High":dist,"Within 25%":w25,"Within 10%":w10,"Within 5%":w5,"Within 2%":w2,"Fresh 52W High":fresh,"RSI14":rsi,"Rel Volume":rv,"Volume Breakout":vb,"Stage 2":stage,"Return 3M %":r3,"Return 6M %":r6,"Return 12M %":r12},h
+    stage_details=chartink_stage2(h);stage=stage_details["Stage 2"];stack=e20>e50>e100>e200;w25,w10,w5,w2=dist>=-25,dist>=-10,dist>=-5,dist>=-2;fresh=p>=hi*.999;vb=bool(pd.notna(rv) and rv>=1.5)
+    return {**stage_details,"Ticker":ticker,"Price":p,"EMA20":e20,"EMA50":e50,"EMA100":e100,"EMA150":e150,"EMA200":e200,"EMA Stack":stack,"EMA200 Rising":e200>old,"52W High":hi,"% From 52W High":dist,"Within 25%":w25,"Within 10%":w10,"Within 5%":w5,"Within 2%":w2,"Fresh 52W High":fresh,"RSI14":rsi,"Rel Volume":rv,"Volume Breakout":vb,"Stage 2":stage,"Return 3M %":r3,"Return 6M %":r6,"Return 12M %":r12},h
 
 u=get_universe(market).reset_index(drop=True);st.info(f"Loaded {len(u)} symbols for {market}. Market history is fetched from Yahoo Finance.")
 bench_cache={};records=[];histories={}
@@ -136,13 +167,13 @@ if market.startswith("USA") or market=="Global":
     st.caption("RS columns = stock return minus S&P 500 return over the same period. Ranking is systematic, not a buy recommendation.")
 
 st.subheader(f"🔥 {market} Momentum Ranking")
-cols=["Country","Ticker","Company","Sector","Currency","Price","Global Momentum Score","Action","Stage 2","% From 52W High","RSI14","Rel Volume","Return 3M %","Return 6M %","Return 12M %","RS 3M %","RS 6M %","RS 12M %","EMA20","EMA50","EMA100","EMA150","EMA200"]
+cols=["Country","Ticker","Company","Sector","Currency","Price","Global Momentum Score","Action","Stage 2","% From 52W High","RSI14","Rel Volume","Return 3M %","Return 6M %","Return 12M %","RS 3M %","RS 6M %","RS 12M %","SMA50","SMA150","SMA200","SMA200 Rising","EMA20","EMA50","EMA100","EMA150","EMA200"]
 show=df[cols].copy()
 for c in show.columns:
-    if c not in ["Country","Ticker","Company","Sector","Currency","Action","Stage 2"]:show[c]=pd.to_numeric(show[c],errors="coerce").round(2)
+    if c not in ["Country","Ticker","Company","Sector","Currency","Action","Stage 2","SMA200 Rising"]:show[c]=pd.to_numeric(show[c],errors="coerce").round(2)
 st.dataframe(show,use_container_width=True,hide_index=True);st.download_button("Download current ranking",data=df.to_csv(index=False).encode("utf-8"),file_name="global_momentum_ranking.csv",mime="text/csv")
 
 if not df.empty:
-    st.subheader("📊 Stock Detail");selected=st.selectbox("Select stock",df["Ticker"].tolist());row=df[df["Ticker"]==selected].iloc[0];sym={"INR":"₹","USD":"$","GBP":"£","EUR":"€","CHF":"CHF "}.get(row["Currency"],"");a,b,c,d=st.columns(4);a.metric("Price",f"{sym}{row['Price']:.2f}");b.metric("Global Momentum",f"{int(row['Global Momentum Score'])}/100");c.metric("6M Return",f"{row['Return 6M %']:.1f}%");d.metric("6M Relative Strength",f"{row['RS 6M %']:+.1f}%");st.line_chart(histories[selected].tail(180)[["Close","EMA20","EMA50","EMA100","EMA200"]],use_container_width=True);st.write(f"**Signal:** {row['Action']} | **Stage 2:** {'Yes' if row['Stage 2'] else 'No'} | **52W distance:** {row['% From 52W High']:.2f}% | **RSI:** {row['RSI14']:.1f} | **Relative volume:** {row['Rel Volume']:.2f}× | **Benchmark:** {row['Benchmark']}")
+    st.subheader("📊 Stock Detail");selected=st.selectbox("Select stock",df["Ticker"].tolist());row=df[df["Ticker"]==selected].iloc[0];sym={"INR":"₹","USD":"$","GBP":"£","EUR":"€","CHF":"CHF "}.get(row["Currency"],"");a,b,c,d=st.columns(4);a.metric("Price",f"{sym}{row['Price']:.2f}");b.metric("Global Momentum",f"{int(row['Global Momentum Score'])}/100");c.metric("6M Return",f"{row['Return 6M %']:.1f}%");d.metric("6M Relative Strength",f"{row['RS 6M %']:+.1f}%");st.line_chart(histories[selected].tail(180)[["Close","SMA50","SMA150","SMA200"]],use_container_width=True);st.write(f"**Signal:** {row['Action']} | **Stage 2:** {'Yes' if row['Stage 2'] else 'No'} | **52W distance:** {row['% From 52W High']:.2f}% | **RSI:** {row['RSI14']:.1f} | **Relative volume:** {row['Rel Volume']:.2f}× | **Benchmark:** {row['Benchmark']}")
 
 st.caption("Systematic momentum screening only: Stage 2, 52-week-high proximity, volume, RSI, 3/6/12-month returns and benchmark-relative strength. Not investment advice.")
