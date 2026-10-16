@@ -1,4 +1,11 @@
 import io
+import json
+import sqlite3
+import tempfile
+import hashlib
+import fcntl
+from pathlib import Path
+from contextlib import contextmanager
 import requests
 import streamlit as st
 import pandas as pd
@@ -15,8 +22,8 @@ EUROPE=[("AZN.L","AstraZeneca","UK","GBP","Health Care"),("SHEL.L","Shell","UK",
 with st.sidebar:
     st.header("Settings")
     market=st.selectbox("Market",["India — All NSE stocks","India — Nifty 500","USA — S&P 500","USA — Nasdaq 100","USA — Combined","Europe / UK","Global"])
-    st.caption("Completed scans are reused for 30 minutes. Filters do not redownload prices. Use Refresh only when you need newer data.")
-    if st.button("🔄 Refresh market data",use_container_width=True): st.cache_data.clear(); st.rerun()
+    st.caption("Saved results reopen without downloading. Use Start / resume to continue an interrupted scan, or Refresh for new prices.")
+    refresh_requested=st.button("🔄 Refresh market data",use_container_width=True)
     strategy=st.selectbox("Strategy",["EMA200 recovery → all-time-high breakout","Stage 2 only","Momentum ranking"])
     recovery_mode=strategy.startswith("EMA200 recovery")
     recovery_only=st.checkbox("Show recovery BUY / HOLD / EXIT signals only",True) if recovery_mode else False
@@ -188,33 +195,111 @@ def extract_ticker_history(batch, ticker, single=False):
         return pd.DataFrame()
     return batch.copy() if single else pd.DataFrame()
 
-@st.cache_data(ttl=1800,max_entries=4,show_spinner=False)
-def scan_prices(tickers, recovery_mode, _progress=None):
+
+SCAN_DIR=Path(tempfile.gettempdir())/"momentum_dashboard_scans_v1"
+SCAN_DIR.mkdir(parents=True,exist_ok=True)
+
+def scan_key(tickers,recovery_mode):
+    return hashlib.sha256(json.dumps([list(tickers),bool(recovery_mode),"v1"]).encode()).hexdigest()
+
+@contextmanager
+def scan_db():
+    conn=sqlite3.connect(str(SCAN_DIR/"scans.sqlite3"),timeout=30)
+    conn.execute("CREATE TABLE IF NOT EXISTS scans (key TEXT PRIMARY KEY, stamp TEXT, offset INTEGER, complete INTEGER)")
+    conn.execute("CREATE TABLE IF NOT EXISTS results (key TEXT, ticker TEXT, record TEXT, history TEXT, PRIMARY KEY (key,ticker))")
+    conn.execute("CREATE TABLE IF NOT EXISTS benchmarks (key TEXT, ticker TEXT, data TEXT, PRIMARY KEY (key,ticker))")
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+def load_saved_scan(key):
+    with scan_db() as conn:
+        state=conn.execute("SELECT stamp,offset,complete FROM scans WHERE key=?",(key,)).fetchone()
+        if state is None:return None
+        rows=conn.execute("SELECT ticker,record,history FROM results WHERE key=? ORDER BY rowid",(key,)).fetchall()
     records=[]
     histories={}
-    batch_size=40
-    for start in range(0,len(tickers),batch_size):
-        symbols=list(tickers[start:start+batch_size])
+    for ticker,record,history in rows:
+        records.append(json.loads(record))
+        h=pd.read_json(io.StringIO(history),orient="split")
+        h.index=pd.to_datetime(h.index)
+        histories[ticker]=h
+    return records,histories,state[0],int(state[1]),bool(state[2])
+
+def save_scan_batch(key, records, histories, offset, complete):
+    stamp=pd.Timestamp.now(tz="UTC").isoformat()
+    def scalar(value):
+        if isinstance(value,np.generic):return value.item()
+        raise TypeError(f"Unsupported snapshot value: {type(value)}")
+    rows=[(key,r["Ticker"],json.dumps(r,default=scalar),
+           histories[r["Ticker"]].to_json(orient="split",date_format="iso",double_precision=15)) for r in records]
+    with scan_db() as conn:
+        conn.executemany("INSERT OR REPLACE INTO results VALUES (?,?,?,?)",rows)
+        conn.execute("INSERT OR REPLACE INTO scans VALUES (?,?,?,?)",(key,stamp,offset,int(complete)))
+    return stamp
+
+def clear_saved_scan(key):
+    with scan_db() as conn:
+        conn.execute("DELETE FROM results WHERE key=?",(key,))
+        conn.execute("DELETE FROM scans WHERE key=?",(key,))
+        conn.execute("DELETE FROM benchmarks WHERE key=?",(key,))
+
+
+
+def saved_benchmark(key,ticker):
+    with scan_db() as conn:
+        row=conn.execute("SELECT data FROM benchmarks WHERE key=? AND ticker=?",(key,ticker)).fetchone()
+    if row:return {int(k):v for k,v in json.loads(row[0]).items()}
+    values=benchmark_returns(ticker)
+    with scan_db() as conn:
+        conn.execute("INSERT OR REPLACE INTO benchmarks VALUES (?,?,?)",(key,ticker,json.dumps(values)))
+    return values
+
+def scan_prices(tickers, recovery_mode, _progress=None, reset=False):
+    key=scan_key(tickers,recovery_mode)
+    # Nonblocking file lock prevents a reconnected browser starting a duplicate job.
+    with (SCAN_DIR/(key+".lock")).open("a") as lock:
         try:
-            batch=yf.download(symbols,period="max" if recovery_mode else "2y",
-                              interval="1d",auto_adjust=False,progress=False,
-                              threads=4,group_by="ticker",timeout=12)
-        except Exception:
-            batch=None
-        for ticker in symbols:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            st.info("This scan is already running. Reopen saved progress after the next batch; a duplicate download was not started.")
+            st.stop()
+        if reset:clear_saved_scan(key)
+        saved=load_saved_scan(key)
+        if saved:
+            records,histories,stamp,offset,complete=saved
+            if complete:return records,histories,stamp
+        else:
+            records,histories,offset=[],{},0
+            stamp=save_scan_batch(key,[],{},0,False)
+        batch_size=40
+        for start in range(offset,len(tickers),batch_size):
+            symbols=list(tickers[start:start+batch_size])
+            previous_count=len(records)
             try:
-                raw=extract_ticker_history(batch,ticker,len(symbols)==1)
-                rec,h=analyze_history(ticker,raw,recovery_mode)
-                if rec is not None:
-                    records.append(rec)
-                    histories[ticker]=h.tail(180).copy()
+                batch=yf.download(symbols,period="max" if recovery_mode else "2y",
+                                  interval="1d",auto_adjust=False,progress=False,
+                                  threads=4,group_by="ticker",timeout=12)
             except Exception:
-                continue
-        if _progress is not None:
+                batch=None
+            for ticker in symbols:
+                try:
+                    raw=extract_ticker_history(batch,ticker,len(symbols)==1)
+                    rec,h=analyze_history(ticker,raw,recovery_mode)
+                    if rec is not None:
+                        records.append(rec)
+                        histories[ticker]=h.tail(180).copy()
+                except Exception:
+                    continue
             done=min(start+batch_size,len(tickers))
-            _progress.progress(done/max(len(tickers),1),
-                               text=f"Processed {done:,} / {len(tickers):,} stocks; usable: {len(records):,}")
-    return records,histories,pd.Timestamp.now(tz="UTC").isoformat()
+            stamp=save_scan_batch(key,records[previous_count:],histories,done,done==len(tickers))
+            if _progress is not None:
+                _progress.progress(done/max(len(tickers),1),
+                                   text=f"Saved {done:,} / {len(tickers):,} stocks; usable: {len(records):,}")
+        return records,histories,stamp
+
 
 try:
     u=get_universe(market).reset_index(drop=True)
@@ -222,10 +307,23 @@ except Exception as exc:
     st.error(f"Could not load the selected stock universe: {exc}. Please refresh; All NSE never falls back to Nifty 500.")
     st.stop()
 st.info(f"Loaded {len(u)} symbols for {market}. Market history is fetched from Yahoo Finance.")
-with st.spinner("Scanning stocks in batches; the first full-history scan can still take several minutes..."):
-    prog=st.progress(0)
-    records,histories,scan_time=scan_prices(tuple(u["Ticker"].astype(str).str.strip()),recovery_mode,prog)
-    prog.empty()
+tickers=tuple(u["Ticker"].astype(str).str.strip())
+saved=load_saved_scan(scan_key(tickers,recovery_mode))
+run_requested=st.button("▶ Start / resume scan",use_container_width=True)
+partial=False
+if refresh_requested or run_requested:
+    if refresh_requested:benchmark_returns.clear()
+    with st.spinner("Scanning and saving each batch. Interrupted scans can resume from the last saved batch."):
+        prog=st.progress(0)
+        records,histories,scan_time=scan_prices(tickers,recovery_mode,prog,reset=refresh_requested)
+        prog.empty()
+elif saved:
+    records,histories,scan_time,offset,complete=saved
+    partial=not complete
+    if partial:st.info(f"Restored partial scan: {offset:,} / {len(tickers):,} processed. Click Start / resume to continue.")
+else:
+    st.info("Click Start / resume scan to download prices. Opening or reconnecting this page does not start a download.")
+    st.stop()
 bench_cache={}
 metadata=u.set_index("Ticker")
 for rec in records:
@@ -233,15 +331,17 @@ for rec in records:
     for field in ["Company","Sector","Country","Currency"]:
         rec[field]=meta.get(field,"")
     bt=benchmark_for(rec["Country"])
-    if bt not in bench_cache:bench_cache[bt]=benchmark_returns(bt)
+    if bt not in bench_cache:bench_cache[bt]=saved_benchmark(scan_key(tickers,recovery_mode),bt)
     br=bench_cache[bt]
     rec["Benchmark"]=bt
     for days,label in [(63,"3M"),(126,"6M"),(252,"12M")]:
         value=rec[f"Return {label} %"]
         rec[f"RS {label} %"]=value-br[days] if pd.notna(value) and pd.notna(br[days]) else np.nan
-st.caption(f"Scan completed: {pd.Timestamp(scan_time).tz_convert('Asia/Kolkata').strftime('%d %b %Y %H:%M IST')}. Cached for 30 minutes; Refresh forces a new download.")
-st.caption(f"Usable price history: {len(records)} / {len(u)} symbols. {len(u)-len(records)} skipped because history was missing, too short, or could not be downloaded.")
-if not records:st.error("No usable Yahoo Finance data was returned. Please try again later.");st.stop()
+st.caption(f"Last saved: {pd.Timestamp(scan_time).tz_convert('Asia/Kolkata').strftime('%d %b %Y %H:%M IST')}. Results stay unchanged until Refresh. Saved scans survive browser reconnects while this server retains its files.")
+st.caption(f"Usable price history: {len(records)} / {len(u)} symbols. " + ("Scan is incomplete; rankings are provisional." if partial else f"{len(u)-len(records)} skipped because history was missing, too short, or could not be downloaded."))
+if not records:
+    st.warning("No usable records in this saved scan yet. Use Start / resume for a partial scan, or Refresh to retry completed downloads.")
+    st.stop()
 
 df=pd.DataFrame(records);all_df=df.copy()
 # Cross-sectional percentile ranks reward stocks outperforming peers without hard-coding return thresholds.
