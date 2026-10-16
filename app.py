@@ -17,11 +17,11 @@ with st.sidebar:
     market=st.selectbox("Market",["India — Nifty 500","USA — S&P 500","USA — Nasdaq 100","USA — Combined","Europe / UK","Global"])
     st.caption("Data refreshes when you reload the page or change a setting.")
     if st.button("🔄 Refresh market data",use_container_width=True): st.cache_data.clear(); st.rerun()
-    strategy=st.selectbox("Strategy",["EMA200 recovery → all-time-high breakout","Stage 2 + momentum ranking"])
+    strategy=st.selectbox("Strategy",["EMA200 recovery → all-time-high breakout","Stage 2 only","Momentum ranking"])
     recovery_mode=strategy.startswith("EMA200 recovery")
     recovery_only=st.checkbox("Show recovery BUY / HOLD / EXIT signals only",True) if recovery_mode else False
     if recovery_mode: st.caption("Below EMA200 within the previous 6 calendar months, then a fresh intraday all-time high. Model exit when daily low touches EMA200. RSI and volume are informational only. Current-session signals are provisional; HOLD/EXIT refer to model positions, not your actual holdings.")
-    only_stage2=st.checkbox("Stage 2 only",False)
+    only_stage2=True if strategy=="Stage 2 only" else st.checkbox("Require Stage 2",False)
     st.caption("Stage 2 uses your SMA50/150/200 template, rising SMA200 over 20 OR 80 OR 100 sessions, weekly 52-week extremes, price >10 and price × average 50-day volume >1,000,000. Global markets use their quoted price units.")
     high_filter=st.selectbox("52-week-high filter",["All","Within 25%","Within 10%","Within 5%","Within 2%"])
     min_rsi=st.slider("Minimum RSI(14)",0,80,0,5)
@@ -204,7 +204,7 @@ if recovery_mode:
     df=df.assign(_order=df["Recovery Signal"].map({"BUY":0,"HOLD":1,"EXIT":2,"AMBIGUOUS":3,"WAIT":4})).sort_values(["_order","Distance to EMA200 %"]).drop(columns="_order").reset_index(drop=True)
 c1,c2,c3,c4,c5=st.columns(5);c1.metric("Stocks scanned",len(all_df));c2.metric("Stage 2",int(all_df["Stage 2"].sum()));c3.metric("Within 5%",int(all_df["Within 5%"].sum()));c4.metric("Within 2%",int(all_df["Within 2%"].sum()));c5.metric("New recovery entries" if recovery_mode else "Breakouts",int((all_df["Action"]==("BUY" if recovery_mode else "BREAKOUT")).sum()))
 
-if not recovery_mode and (market.startswith("USA") or market=="Global"):
+if strategy=="Momentum ranking" and (market.startswith("USA") or market=="Global"):
     st.subheader("🇺🇸 Top USA Momentum")
     usa=all_df[all_df["Country"]=="USA"].sort_values(["Global Momentum Score","RS 6M %"],ascending=False).head(20)
     usa_cols=["Ticker","Company","Sector","Price","Global Momentum Score","Action","Stage 2","% From 52W High","RSI14","Rel Volume","Return 3M %","Return 6M %","Return 12M %","RS 3M %","RS 6M %","RS 12M %"]
@@ -214,7 +214,7 @@ if not recovery_mode and (market.startswith("USA") or market=="Global"):
     st.dataframe(usa_show,use_container_width=True,hide_index=True)
     st.caption("RS columns = stock return minus S&P 500 return over the same period. Ranking is systematic, not a buy recommendation.")
 
-st.subheader(f"🔥 {market} Momentum Ranking")
+st.subheader(f"🔥 {market} — {strategy}")
 cols=["Country","Ticker","Company","Sector","Currency","Price","Global Momentum Score","Action","Stage 2","% From 52W High","RSI14","Rel Volume","Return 3M %","Return 6M %","Return 12M %","RS 3M %","RS 6M %","RS 12M %","SMA50","SMA150","SMA200","SMA200 Rising","EMA20","EMA50","EMA100","EMA150","EMA200"]
 if recovery_mode:
     cols=["Country","Ticker","Company","Currency","Price","Recovery Signal","Below EMA200 in 6M","Prior All-Time High","Recovery EMA200","Distance to EMA200 %","Model Entry Date","Data Date","History From"]
