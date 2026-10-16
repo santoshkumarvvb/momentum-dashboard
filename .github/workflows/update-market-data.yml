@@ -1,0 +1,53 @@
+name: Update prepared market data
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/update-market-data.yml'
+      - 'background_update.py'
+      - 'market_engine.py'
+  schedule:
+    - cron: '47 12 * * 1-5' # India: 18:17 IST, after close
+    - cron: '47 22 * * 1-5' # USA/Europe: after the US close
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    name: Prepare ${{ matrix.region }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        region: [india, usa, europe]
+    concurrency:
+      group: market-data-${{ matrix.region }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install data dependencies
+        run: pip install -r requirements.txt
+      - name: Verify updater and snapshot routing
+        run: python -m unittest test_background -v
+      - name: Ensure persistent data release exists
+        shell: bash
+        run: |
+          gh release view market-data --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+          gh release create market-data --repo "$GITHUB_REPOSITORY" --target main --title "Prepared market data" --notes "Daily price database and prepared screener snapshots. Public market data only." --latest=false ||
+          gh release view market-data --repo "$GITHUB_REPOSITORY"
+      - name: Update history and publish prepared results
+        if: >-
+          github.event_name != 'schedule' ||
+          (matrix.region == 'india' && github.event.schedule == '47 12 * * 1-5') ||
+          (matrix.region != 'india' && github.event.schedule == '47 22 * * 1-5')
+        run: python background_update.py --region "${{ matrix.region }}"

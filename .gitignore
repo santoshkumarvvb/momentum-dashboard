@@ -1,0 +1,4 @@
+__pycache__/
+.background-data/
+.pytest_cache/
+*.pyc
