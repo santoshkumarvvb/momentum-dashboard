@@ -17,6 +17,10 @@ with st.sidebar:
     market=st.selectbox("Market",["India — Nifty 500","USA — S&P 500","USA — Nasdaq 100","USA — Combined","Europe / UK","Global"])
     st.caption("Data refreshes when you reload the page or change a setting.")
     if st.button("🔄 Refresh market data",use_container_width=True): st.cache_data.clear(); st.rerun()
+    strategy=st.selectbox("Strategy",["EMA200 recovery → all-time-high breakout","Stage 2 + momentum ranking"])
+    recovery_mode=strategy.startswith("EMA200 recovery")
+    recovery_only=st.checkbox("Show recovery BUY / HOLD / EXIT signals only",True) if recovery_mode else False
+    if recovery_mode: st.caption("Below EMA200 within the previous 6 calendar months, then a fresh intraday all-time high. Model exit when daily low touches EMA200. RSI and volume are informational only. Current-session signals are provisional; HOLD/EXIT refer to model positions, not your actual holdings.")
     only_stage2=st.checkbox("Stage 2 only",False)
     st.caption("Stage 2 uses your SMA50/150/200 template, rising SMA200 over 20 OR 80 OR 100 sessions, weekly 52-week extremes, price >10 and price × average 50-day volume >1,000,000. Global markets use their quoted price units.")
     high_filter=st.selectbox("52-week-high filter",["All","Within 25%","Within 10%","Within 5%","Within 2%"])
@@ -99,9 +103,47 @@ def chartink_stage2(h):
             "Stage 2 Weekly Low": lo, "Avg Volume 50": avgvol50,
             "Stage 2 History Ready": bool(ready)}
 
+
+def recovery_ath_signals(h):
+    """Daily model on all available, split-adjusted Yahoo history; not an order executor."""
+    c=h["Close"].astype(float)
+    ema=c.ewm(span=200,adjust=False,min_periods=200).mean()
+    prior_high=h["High"].astype(float).cummax().shift(1)
+    below=(c < ema)
+    active=False
+    entry_date=""
+    last_below=None
+    signal="WAIT"
+    recent=False
+    for i,(date,row) in enumerate(h.iterrows()):
+        signal="HOLD" if active else "WAIT"
+        cutoff=date-pd.DateOffset(months=6)
+        recent=last_below is not None and last_below >= cutoff
+        if pd.notna(ema.iloc[i]):
+            touch=float(row["Low"]) <= float(ema.iloc[i])
+            if active and touch:
+                active=False
+                signal="EXIT"
+            elif not active and recent and float(row["High"]) > float(prior_high.iloc[i]) and float(row["Close"]) > float(ema.iloc[i]):
+                # Daily bars cannot establish event order if breakout and exit both occur.
+                if touch:
+                    signal="AMBIGUOUS"
+                else:
+                    active=True
+                    entry_date=str(date.date())
+                    signal="BUY"
+        if bool(below.iloc[i]):
+            last_below=date
+    return {"Recovery Signal":signal, "Below EMA200 in 6M":bool(recent),
+            "Prior All-Time High":float(prior_high.iloc[-1]),
+            "Recovery EMA200":float(ema.iloc[-1]),
+            "Distance to EMA200 %":(float(c.iloc[-1])/float(ema.iloc[-1])-1)*100,
+            "Model Entry Date":entry_date if active or signal=="EXIT" else "",
+            "History From":str(h.index[0].date()), "Data Date":str(h.index[-1].date())}
+
 @st.cache_data(ttl=900,show_spinner=False)
-def fetch_one(ticker):
-    h=yf.download(ticker,period="18mo",interval="1d",auto_adjust=False,progress=False,threads=False)
+def fetch_one(ticker, recovery_mode=False):
+    h=yf.download(ticker,period="max" if recovery_mode else "18mo",interval="1d",auto_adjust=False,progress=False,threads=False)
     if h is None or h.empty:return None,None
     if isinstance(h.columns,pd.MultiIndex):h.columns=h.columns.get_level_values(0)
     h=h.dropna(subset=["Close"]).copy()
@@ -113,7 +155,7 @@ def fetch_one(ticker):
     row=h.iloc[-1];p=float(row["Close"]);e20,e50,e100,e150,e200=[float(row[f"EMA{n}"]) for n in [20,50,100,150,200]];old=float(h["EMA200"].iloc[-21]);hi=float(high.tail(252).max());lo=float(low.tail(252).min());dist=(p/hi-1)*100;rsi=float(row["RSI14"]) if pd.notna(row["RSI14"]) else np.nan;rv=float(row["RelVol"]) if pd.notna(row["RelVol"]) else np.nan
     r3,r6,r12=period_return(close,63),period_return(close,126),period_return(close,252)
     stage_details=chartink_stage2(h);stage=stage_details["Stage 2"];stack=e20>e50>e100>e200;w25,w10,w5,w2=dist>=-25,dist>=-10,dist>=-5,dist>=-2;fresh=p>=hi*.999;vb=bool(pd.notna(rv) and rv>=1.5)
-    return {**stage_details,"Ticker":ticker,"Price":p,"EMA20":e20,"EMA50":e50,"EMA100":e100,"EMA150":e150,"EMA200":e200,"EMA Stack":stack,"EMA200 Rising":e200>old,"52W High":hi,"% From 52W High":dist,"Within 25%":w25,"Within 10%":w10,"Within 5%":w5,"Within 2%":w2,"Fresh 52W High":fresh,"RSI14":rsi,"Rel Volume":rv,"Volume Breakout":vb,"Stage 2":stage,"Return 3M %":r3,"Return 6M %":r6,"Return 12M %":r12},h
+    return {**(recovery_ath_signals(h) if recovery_mode else {}),**stage_details,"Ticker":ticker,"Price":p,"EMA20":e20,"EMA50":e50,"EMA100":e100,"EMA150":e150,"EMA200":e200,"EMA Stack":stack,"EMA200 Rising":e200>old,"52W High":hi,"% From 52W High":dist,"Within 25%":w25,"Within 10%":w10,"Within 5%":w5,"Within 2%":w2,"Fresh 52W High":fresh,"RSI14":rsi,"Rel Volume":rv,"Volume Breakout":vb,"Stage 2":stage,"Return 3M %":r3,"Return 6M %":r6,"Return 12M %":r12},h
 
 u=get_universe(market).reset_index(drop=True);st.info(f"Loaded {len(u)} symbols for {market}. Market history is fetched from Yahoo Finance.")
 bench_cache={};records=[];histories={}
@@ -122,7 +164,7 @@ with st.spinner("Downloading market data and calculating Stage 2 + relative-stre
     for i,(_,s) in enumerate(u.iterrows(),1):
         t=str(s["Ticker"]).strip()
         try:
-            rec,h=fetch_one(t)
+            rec,h=fetch_one(t,recovery_mode)
             if rec is not None:
                 for c in ["Company","Sector","Country","Currency"]:rec[c]=s.get(c,"")
                 bt=benchmark_for(rec["Country"])
@@ -146,7 +188,11 @@ rs_bonus=np.select([(df["RS 3M %"]>0)&(df["RS 6M %"]>0)&(df["RS 12M %"]>0),(df["
 # Normalize to 100 because raw components can total 110.
 df["Global Momentum Score"]=np.minimum(100,np.round((trend_points+high_points+volume_points+rsi_points+return_points+rs_bonus)*100/110)).astype(int)
 df["Action"]=np.select([(df["Stage 2"])&(df["Within 2%"])&(df["Rel Volume"]>=1.5)&(df["RS 6M %"]>0),(df["Stage 2"])&(df["Within 5%"])&(df["RS 6M %"]>0),df["Stage 2"]],["BREAKOUT","WATCH","STAGE 2"],default="AVOID")
+if recovery_mode:
+    df["Stage 2 Action"]=df["Action"]
+    df["Action"]=df["Recovery Signal"]
 all_df=df.copy()
+if recovery_mode and recovery_only:df=df[df["Recovery Signal"].isin(["BUY","HOLD","EXIT","AMBIGUOUS"])]
 if only_stage2:df=df[df["Stage 2"]]
 fm={"Within 25%":"Within 25%","Within 10%":"Within 10%","Within 5%":"Within 5%","Within 2%":"Within 2%"}
 if high_filter in fm:df=df[df[fm[high_filter]]]
@@ -154,9 +200,11 @@ if min_rsi:df=df[df["RSI14"]>=min_rsi]
 if min_relvol:df=df[df["Rel Volume"]>=min_relvol]
 df=df.sort_values(["Global Momentum Score","RS 6M %","% From 52W High"],ascending=[False,False,False]).reset_index(drop=True)
 
-c1,c2,c3,c4,c5=st.columns(5);c1.metric("Stocks scanned",len(all_df));c2.metric("Stage 2",int(all_df["Stage 2"].sum()));c3.metric("Within 5%",int(all_df["Within 5%"].sum()));c4.metric("Within 2%",int(all_df["Within 2%"].sum()));c5.metric("Breakouts",int((all_df["Action"]=="BREAKOUT").sum()))
+if recovery_mode:
+    df=df.assign(_order=df["Recovery Signal"].map({"BUY":0,"HOLD":1,"EXIT":2,"AMBIGUOUS":3,"WAIT":4})).sort_values(["_order","Distance to EMA200 %"]).drop(columns="_order").reset_index(drop=True)
+c1,c2,c3,c4,c5=st.columns(5);c1.metric("Stocks scanned",len(all_df));c2.metric("Stage 2",int(all_df["Stage 2"].sum()));c3.metric("Within 5%",int(all_df["Within 5%"].sum()));c4.metric("Within 2%",int(all_df["Within 2%"].sum()));c5.metric("New recovery entries" if recovery_mode else "Breakouts",int((all_df["Action"]==("BUY" if recovery_mode else "BREAKOUT")).sum()))
 
-if market.startswith("USA") or market=="Global":
+if not recovery_mode and (market.startswith("USA") or market=="Global"):
     st.subheader("🇺🇸 Top USA Momentum")
     usa=all_df[all_df["Country"]=="USA"].sort_values(["Global Momentum Score","RS 6M %"],ascending=False).head(20)
     usa_cols=["Ticker","Company","Sector","Price","Global Momentum Score","Action","Stage 2","% From 52W High","RSI14","Rel Volume","Return 3M %","Return 6M %","Return 12M %","RS 3M %","RS 6M %","RS 12M %"]
@@ -168,12 +216,16 @@ if market.startswith("USA") or market=="Global":
 
 st.subheader(f"🔥 {market} Momentum Ranking")
 cols=["Country","Ticker","Company","Sector","Currency","Price","Global Momentum Score","Action","Stage 2","% From 52W High","RSI14","Rel Volume","Return 3M %","Return 6M %","Return 12M %","RS 3M %","RS 6M %","RS 12M %","SMA50","SMA150","SMA200","SMA200 Rising","EMA20","EMA50","EMA100","EMA150","EMA200"]
+if recovery_mode:
+    cols=["Country","Ticker","Company","Currency","Price","Recovery Signal","Below EMA200 in 6M","Prior All-Time High","Recovery EMA200","Distance to EMA200 %","Model Entry Date","Data Date","History From"]
+    st.caption("ATH means highest intraday high in all available Yahoo history, excluding the current bar. The recovery test uses a daily close below EMA200 within 6 calendar months before entry. Prices are split-adjusted by Yahoo; missing early history can affect ATH. Model signals are not actual holdings or trade fills. The old momentum score does not control this strategy.")
 show=df[cols].copy()
 for c in show.columns:
-    if c not in ["Country","Ticker","Company","Sector","Currency","Action","Stage 2","SMA200 Rising"]:show[c]=pd.to_numeric(show[c],errors="coerce").round(2)
+    if c not in ["Country","Ticker","Company","Sector","Currency","Action","Stage 2","SMA200 Rising","Recovery Signal","Below EMA200 in 6M","Model Entry Date","Data Date","History From"]:show[c]=pd.to_numeric(show[c],errors="coerce").round(2)
 st.dataframe(show,use_container_width=True,hide_index=True);st.download_button("Download current ranking",data=df.to_csv(index=False).encode("utf-8"),file_name="global_momentum_ranking.csv",mime="text/csv")
 
 if not df.empty:
-    st.subheader("📊 Stock Detail");selected=st.selectbox("Select stock",df["Ticker"].tolist());row=df[df["Ticker"]==selected].iloc[0];sym={"INR":"₹","USD":"$","GBP":"£","EUR":"€","CHF":"CHF "}.get(row["Currency"],"");a,b,c,d=st.columns(4);a.metric("Price",f"{sym}{row['Price']:.2f}");b.metric("Global Momentum",f"{int(row['Global Momentum Score'])}/100");c.metric("6M Return",f"{row['Return 6M %']:.1f}%");d.metric("6M Relative Strength",f"{row['RS 6M %']:+.1f}%");st.line_chart(histories[selected].tail(180)[["Close","SMA50","SMA150","SMA200"]],use_container_width=True);st.write(f"**Signal:** {row['Action']} | **Stage 2:** {'Yes' if row['Stage 2'] else 'No'} | **52W distance:** {row['% From 52W High']:.2f}% | **RSI:** {row['RSI14']:.1f} | **Relative volume:** {row['Rel Volume']:.2f}× | **Benchmark:** {row['Benchmark']}")
+    st.subheader("📊 Stock Detail");selected=st.selectbox("Select stock",df["Ticker"].tolist());row=df[df["Ticker"]==selected].iloc[0];sym={"INR":"₹","USD":"$","GBP":"£","EUR":"€","CHF":"CHF "}.get(row["Currency"],"");a,b,c,d=st.columns(4);a.metric("Price",f"{sym}{row['Price']:.2f}");b.metric("Recovery signal",row["Recovery Signal"]) if recovery_mode else b.metric("Global Momentum",f"{int(row['Global Momentum Score'])}/100");c.metric("6M Return",f"{row['Return 6M %']:.1f}%");d.metric("6M Relative Strength",f"{row['RS 6M %']:+.1f}%");st.line_chart(histories[selected].tail(180)[["Close","EMA200"] if recovery_mode else ["Close","SMA50","SMA150","SMA200"]],use_container_width=True);st.write(f"**Signal:** {row['Action']} | **Stage 2:** {'Yes' if row['Stage 2'] else 'No'} | **52W distance:** {row['% From 52W High']:.2f}% | **RSI:** {row['RSI14']:.1f} | **Relative volume:** {row['Rel Volume']:.2f}× | **Benchmark:** {row['Benchmark']}")
 
 st.caption("Systematic momentum screening only: Stage 2, 52-week-high proximity, volume, RSI, 3/6/12-month returns and benchmark-relative strength. Not investment advice.")
+
