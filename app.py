@@ -15,7 +15,7 @@ EUROPE=[("AZN.L","AstraZeneca","UK","GBP","Health Care"),("SHEL.L","Shell","UK",
 with st.sidebar:
     st.header("Settings")
     market=st.selectbox("Market",["India — All NSE stocks","India — Nifty 500","USA — S&P 500","USA — Nasdaq 100","USA — Combined","Europe / UK","Global"])
-    st.caption("Data refreshes when you reload the page or change a setting.")
+    st.caption("Completed scans are reused for 30 minutes. Filters do not redownload prices. Use Refresh only when you need newer data.")
     if st.button("🔄 Refresh market data",use_container_width=True): st.cache_data.clear(); st.rerun()
     strategy=st.selectbox("Strategy",["EMA200 recovery → all-time-high breakout","Stage 2 only","Momentum ranking"])
     recovery_mode=strategy.startswith("EMA200 recovery")
@@ -94,7 +94,7 @@ def period_return(s,days):
 @st.cache_data(ttl=900,show_spinner=False)
 def benchmark_returns(ticker):
     try:
-        h=yf.download(ticker,period="18mo",interval="1d",auto_adjust=True,progress=False,threads=False)
+        h=yf.download(ticker,period="2y",interval="1d",auto_adjust=True,progress=False,threads=False)
         if isinstance(h.columns,pd.MultiIndex):h.columns=h.columns.get_level_values(0)
         c=h["Close"].dropna().astype(float)
         return {63:period_return(c,63),126:period_return(c,126),252:period_return(c,252)}
@@ -135,31 +135,27 @@ def recovery_ath_signals(h):
     c=h["Close"].astype(float)
     ema=c.ewm(span=200,adjust=False,min_periods=200).mean()
     prior_high=h["High"].astype(float).cummax().shift(1)
-    below=(c < ema)
+    dates=pd.Series(h.index,index=h.index)
+    last_below=dates.where(c < ema).ffill().shift(1)
+    recent_flags=(last_below >= (h.index-pd.DateOffset(months=6))).to_numpy()
+    touches=(h["Low"].astype(float)<=ema).to_numpy()
+    breakouts=((h["High"].astype(float)>prior_high)&(c>ema)).to_numpy()
     active=False
     entry_date=""
-    last_below=None
     signal="WAIT"
-    recent=False
-    for i,(date,row) in enumerate(h.iterrows()):
+    for i in range(len(h)):
         signal="HOLD" if active else "WAIT"
-        cutoff=date-pd.DateOffset(months=6)
-        recent=last_below is not None and last_below >= cutoff
-        if pd.notna(ema.iloc[i]):
-            touch=float(row["Low"]) <= float(ema.iloc[i])
-            if active and touch:
-                active=False
-                signal="EXIT"
-            elif not active and recent and float(row["High"]) > float(prior_high.iloc[i]) and float(row["Close"]) > float(ema.iloc[i]):
-                # Daily bars cannot establish event order if breakout and exit both occur.
-                if touch:
-                    signal="AMBIGUOUS"
-                else:
-                    active=True
-                    entry_date=str(date.date())
-                    signal="BUY"
-        if bool(below.iloc[i]):
-            last_below=date
+        if active and touches[i]:
+            active=False
+            signal="EXIT"
+        elif not active and recent_flags[i] and breakouts[i]:
+            if touches[i]:
+                signal="AMBIGUOUS"
+            else:
+                active=True
+                entry_date=str(h.index[i].date())
+                signal="BUY"
+    recent=bool(recent_flags[-1])
     return {"Recovery Signal":signal, "Below EMA200 in 6M":bool(recent),
             "Prior All-Time High":float(prior_high.iloc[-1]),
             "Recovery EMA200":float(ema.iloc[-1]),
@@ -167,9 +163,7 @@ def recovery_ath_signals(h):
             "Model Entry Date":entry_date if active or signal=="EXIT" else "",
             "History From":str(h.index[0].date()), "Data Date":str(h.index[-1].date())}
 
-@st.cache_data(ttl=900,show_spinner=False)
-def fetch_one(ticker, recovery_mode=False):
-    h=yf.download(ticker,period="max" if recovery_mode else "18mo",interval="1d",auto_adjust=False,progress=False,threads=False)
+def analyze_history(ticker, h, recovery_mode=False):
     if h is None or h.empty:return None,None
     if isinstance(h.columns,pd.MultiIndex):h.columns=h.columns.get_level_values(0)
     h=h.dropna(subset=["Close"]).copy()
@@ -183,28 +177,69 @@ def fetch_one(ticker, recovery_mode=False):
     stage_details=chartink_stage2(h);stage=stage_details["Stage 2"];stack=e20>e50>e100>e200;w25,w10,w5,w2=dist>=-25,dist>=-10,dist>=-5,dist>=-2;fresh=p>=hi*.999;vb=bool(pd.notna(rv) and rv>=1.5)
     return {**(recovery_ath_signals(h) if recovery_mode else {}),**stage_details,"Ticker":ticker,"Price":p,"EMA20":e20,"EMA50":e50,"EMA100":e100,"EMA150":e150,"EMA200":e200,"EMA Stack":stack,"EMA200 Rising":e200>old,"52W High":hi,"% From 52W High":dist,"Within 25%":w25,"Within 10%":w10,"Within 5%":w5,"Within 2%":w2,"Fresh 52W High":fresh,"RSI14":rsi,"Rel Volume":rv,"Volume Breakout":vb,"Stage 2":stage,"Return 3M %":r3,"Return 6M %":r6,"Return 12M %":r12},h
 
+
+def extract_ticker_history(batch, ticker, single=False):
+    if batch is None or batch.empty:
+        return pd.DataFrame()
+    if isinstance(batch.columns,pd.MultiIndex):
+        for level in range(batch.columns.nlevels):
+            if ticker in batch.columns.get_level_values(level):
+                return batch.xs(ticker,axis=1,level=level).copy()
+        return pd.DataFrame()
+    return batch.copy() if single else pd.DataFrame()
+
+@st.cache_data(ttl=1800,max_entries=4,show_spinner=False)
+def scan_prices(tickers, recovery_mode, _progress=None):
+    records=[]
+    histories={}
+    batch_size=40
+    for start in range(0,len(tickers),batch_size):
+        symbols=list(tickers[start:start+batch_size])
+        try:
+            batch=yf.download(symbols,period="max" if recovery_mode else "2y",
+                              interval="1d",auto_adjust=False,progress=False,
+                              threads=4,group_by="ticker",timeout=12)
+        except Exception:
+            batch=None
+        for ticker in symbols:
+            try:
+                raw=extract_ticker_history(batch,ticker,len(symbols)==1)
+                rec,h=analyze_history(ticker,raw,recovery_mode)
+                if rec is not None:
+                    records.append(rec)
+                    histories[ticker]=h.tail(180).copy()
+            except Exception:
+                continue
+        if _progress is not None:
+            done=min(start+batch_size,len(tickers))
+            _progress.progress(done/max(len(tickers),1),
+                               text=f"Processed {done:,} / {len(tickers):,} stocks; usable: {len(records):,}")
+    return records,histories,pd.Timestamp.now(tz="UTC").isoformat()
+
 try:
     u=get_universe(market).reset_index(drop=True)
 except Exception as exc:
     st.error(f"Could not load the selected stock universe: {exc}. Please refresh; All NSE never falls back to Nifty 500.")
     st.stop()
 st.info(f"Loaded {len(u)} symbols for {market}. Market history is fetched from Yahoo Finance.")
-bench_cache={};records=[];histories={}
-with st.spinner("Downloading market data and calculating Stage 2 + relative-strength momentum..."):
-    prog=st.progress(0);total=max(len(u),1)
-    for i,(_,s) in enumerate(u.iterrows(),1):
-        t=str(s["Ticker"]).strip()
-        try:
-            rec,h=fetch_one(t,recovery_mode)
-            if rec is not None:
-                for c in ["Company","Sector","Country","Currency"]:rec[c]=s.get(c,"")
-                bt=benchmark_for(rec["Country"])
-                if bt not in bench_cache:bench_cache[bt]=benchmark_returns(bt)
-                br=bench_cache[bt];rec["Benchmark"]=bt;rec["RS 3M %"]=rec["Return 3M %"]-br[63] if pd.notna(rec["Return 3M %"]) and pd.notna(br[63]) else np.nan;rec["RS 6M %"]=rec["Return 6M %"]-br[126] if pd.notna(rec["Return 6M %"]) and pd.notna(br[126]) else np.nan;rec["RS 12M %"]=rec["Return 12M %"]-br[252] if pd.notna(rec["Return 12M %"]) and pd.notna(br[252]) else np.nan
-                records.append(rec);histories[t]=h
-        except Exception:pass
-        prog.progress(i/total)
+with st.spinner("Scanning stocks in batches; the first full-history scan can still take several minutes..."):
+    prog=st.progress(0)
+    records,histories,scan_time=scan_prices(tuple(u["Ticker"].astype(str).str.strip()),recovery_mode,prog)
     prog.empty()
+bench_cache={}
+metadata=u.set_index("Ticker")
+for rec in records:
+    meta=metadata.loc[rec["Ticker"]]
+    for field in ["Company","Sector","Country","Currency"]:
+        rec[field]=meta.get(field,"")
+    bt=benchmark_for(rec["Country"])
+    if bt not in bench_cache:bench_cache[bt]=benchmark_returns(bt)
+    br=bench_cache[bt]
+    rec["Benchmark"]=bt
+    for days,label in [(63,"3M"),(126,"6M"),(252,"12M")]:
+        value=rec[f"Return {label} %"]
+        rec[f"RS {label} %"]=value-br[days] if pd.notna(value) and pd.notna(br[days]) else np.nan
+st.caption(f"Scan completed: {pd.Timestamp(scan_time).tz_convert('Asia/Kolkata').strftime('%d %b %Y %H:%M IST')}. Cached for 30 minutes; Refresh forces a new download.")
 st.caption(f"Usable price history: {len(records)} / {len(u)} symbols. {len(u)-len(records)} skipped because history was missing, too short, or could not be downloaded.")
 if not records:st.error("No usable Yahoo Finance data was returned. Please try again later.");st.stop()
 
