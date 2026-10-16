@@ -7,14 +7,14 @@ import yfinance as yf
 
 st.set_page_config(page_title="Global Stage 2 Momentum Dashboard", page_icon="📈", layout="wide")
 st.title("📈 Global Stage 2 Momentum Dashboard")
-st.caption("India • USA • Europe/UK • Stage 2 + 52-week-high + multi-period relative-strength momentum • Yahoo Finance")
+st.caption("India (All NSE / Nifty 500) • USA • Europe/UK • Stage 2 + 52-week-high + multi-period relative-strength momentum • Yahoo Finance")
 
 NIFTY500_URL="https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 EUROPE=[("AZN.L","AstraZeneca","UK","GBP","Health Care"),("SHEL.L","Shell","UK","GBP","Energy"),("HSBA.L","HSBC Holdings","UK","GBP","Financials"),("ULVR.L","Unilever","UK","GBP","Consumer Staples"),("REL.L","RELX","UK","GBP","Industrials"),("LSEG.L","London Stock Exchange Group","UK","GBP","Financials"),("RR.L","Rolls-Royce Holdings","UK","GBP","Industrials"),("BA.L","BAE Systems","UK","GBP","Industrials"),("NG.L","National Grid","UK","GBP","Utilities"),("GSK.L","GSK","UK","GBP","Health Care"),("SAP.DE","SAP","Germany","EUR","Technology"),("SIE.DE","Siemens","Germany","EUR","Industrials"),("ALV.DE","Allianz","Germany","EUR","Financials"),("DTE.DE","Deutsche Telekom","Germany","EUR","Communication Services"),("MUV2.DE","Munich Re","Germany","EUR","Financials"),("RHM.DE","Rheinmetall","Germany","EUR","Industrials"),("AIR.PA","Airbus","France","EUR","Industrials"),("MC.PA","LVMH","France","EUR","Consumer Discretionary"),("OR.PA","L'Oreal","France","EUR","Consumer Staples"),("SU.PA","Schneider Electric","France","EUR","Industrials"),("SAF.PA","Safran","France","EUR","Industrials"),("TTE.PA","TotalEnergies","France","EUR","Energy"),("ASML.AS","ASML Holding","Netherlands","EUR","Technology"),("INGA.AS","ING Groep","Netherlands","EUR","Financials"),("PHIA.AS","Philips","Netherlands","EUR","Health Care"),("AD.AS","Ahold Delhaize","Netherlands","EUR","Consumer Staples"),("NOVN.SW","Novartis","Switzerland","CHF","Health Care"),("ROG.SW","Roche","Switzerland","CHF","Health Care"),("NESN.SW","Nestle","Switzerland","CHF","Consumer Staples"),("UBSG.SW","UBS Group","Switzerland","CHF","Financials"),("ABBN.SW","ABB","Switzerland","CHF","Industrials")]
 
 with st.sidebar:
     st.header("Settings")
-    market=st.selectbox("Market",["India — Nifty 500","USA — S&P 500","USA — Nasdaq 100","USA — Combined","Europe / UK","Global"])
+    market=st.selectbox("Market",["India — All NSE stocks","India — Nifty 500","USA — S&P 500","USA — Nasdaq 100","USA — Combined","Europe / UK","Global"])
     st.caption("Data refreshes when you reload the page or change a setting.")
     if st.button("🔄 Refresh market data",use_container_width=True): st.cache_data.clear(); st.rerun()
     strategy=st.selectbox("Strategy",["EMA200 recovery → all-time-high breakout","Stage 2 only","Momentum ranking"])
@@ -26,6 +26,31 @@ with st.sidebar:
     high_filter=st.selectbox("52-week-high filter",["All","Within 25%","Within 10%","Within 5%","Within 2%"])
     min_rsi=st.slider("Minimum RSI(14)",0,80,0,5)
     min_relvol=st.select_slider("Minimum relative volume",options=[0.0,.75,1.0,1.25,1.5,2.0],value=0.0)
+
+
+def normalize_nse_list(raw, segment):
+    raw=raw.rename(columns=lambda c: str(c).strip().upper().replace(" ", "_"))
+    if "SYMBOL" not in raw or "NAME_OF_COMPANY" not in raw:
+        raise ValueError("NSE security list is missing symbol/company columns")
+    symbols=raw["SYMBOL"].fillna("").astype(str).str.strip()
+    out=pd.DataFrame({"Ticker":symbols+".NS","Company":raw["NAME_OF_COMPANY"].fillna("").astype(str).str.strip(),
+                      "Sector":"","Country":"India","Currency":"INR","Segment":segment})
+    return out[symbols.ne("")].drop_duplicates("Ticker")
+
+@st.cache_data(ttl=86400,show_spinner=False)
+def load_all_nse():
+    sources=[
+        ("Mainboard","https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"),
+        ("SME","https://nsearchives.nseindia.com/emerge/corporates/content/SME_EQUITY_L.csv"),
+    ]
+    frames=[]
+    for segment,url in sources:
+        r=requests.get(url,headers={"User-Agent":"Mozilla/5.0","Accept":"text/csv,*/*"},timeout=30)
+        r.raise_for_status()
+        frames.append(normalize_nse_list(pd.read_csv(io.BytesIO(r.content)),segment))
+    out=pd.concat(frames,ignore_index=True).drop_duplicates("Ticker").reset_index(drop=True)
+    if out.empty: raise ValueError("NSE security lists were empty")
+    return out
 
 @st.cache_data(ttl=86400,show_spinner=False)
 def load_india():
@@ -43,12 +68,13 @@ def load_nasdaq():
 @st.cache_data(ttl=86400,show_spinner=False)
 def load_europe():return pd.DataFrame(EUROPE,columns=["Ticker","Company","Country","Currency","Sector"])
 def get_universe(n):
+    if n=="India — All NSE stocks":return load_all_nse()
     if n=="India — Nifty 500":return load_india()
     if n=="USA — S&P 500":return load_sp500()
     if n=="USA — Nasdaq 100":return load_nasdaq()
     if n=="USA — Combined":return pd.concat([load_sp500(),load_nasdaq()]).drop_duplicates("Ticker")
     if n=="Europe / UK":return load_europe()
-    return pd.concat([load_india(),load_sp500(),load_nasdaq(),load_europe()]).drop_duplicates("Ticker")
+    return pd.concat([load_all_nse(),load_sp500(),load_nasdaq(),load_europe()]).drop_duplicates("Ticker")
 
 def benchmark_for(country):
     if country=="India":return "^NSEI"
@@ -157,7 +183,12 @@ def fetch_one(ticker, recovery_mode=False):
     stage_details=chartink_stage2(h);stage=stage_details["Stage 2"];stack=e20>e50>e100>e200;w25,w10,w5,w2=dist>=-25,dist>=-10,dist>=-5,dist>=-2;fresh=p>=hi*.999;vb=bool(pd.notna(rv) and rv>=1.5)
     return {**(recovery_ath_signals(h) if recovery_mode else {}),**stage_details,"Ticker":ticker,"Price":p,"EMA20":e20,"EMA50":e50,"EMA100":e100,"EMA150":e150,"EMA200":e200,"EMA Stack":stack,"EMA200 Rising":e200>old,"52W High":hi,"% From 52W High":dist,"Within 25%":w25,"Within 10%":w10,"Within 5%":w5,"Within 2%":w2,"Fresh 52W High":fresh,"RSI14":rsi,"Rel Volume":rv,"Volume Breakout":vb,"Stage 2":stage,"Return 3M %":r3,"Return 6M %":r6,"Return 12M %":r12},h
 
-u=get_universe(market).reset_index(drop=True);st.info(f"Loaded {len(u)} symbols for {market}. Market history is fetched from Yahoo Finance.")
+try:
+    u=get_universe(market).reset_index(drop=True)
+except Exception as exc:
+    st.error(f"Could not load the selected stock universe: {exc}. Please refresh; All NSE never falls back to Nifty 500.")
+    st.stop()
+st.info(f"Loaded {len(u)} symbols for {market}. Market history is fetched from Yahoo Finance.")
 bench_cache={};records=[];histories={}
 with st.spinner("Downloading market data and calculating Stage 2 + relative-strength momentum..."):
     prog=st.progress(0);total=max(len(u),1)
@@ -174,6 +205,7 @@ with st.spinner("Downloading market data and calculating Stage 2 + relative-stre
         except Exception:pass
         prog.progress(i/total)
     prog.empty()
+st.caption(f"Usable price history: {len(records)} / {len(u)} symbols. {len(u)-len(records)} skipped because history was missing, too short, or could not be downloaded.")
 if not records:st.error("No usable Yahoo Finance data was returned. Please try again later.");st.stop()
 
 df=pd.DataFrame(records);all_df=df.copy()
