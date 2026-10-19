@@ -26,11 +26,15 @@ with st.sidebar:
     st.caption("Prepared daily results update in the background. Manual scans remain available.")
     st.caption("Saved results reopen without downloading. Use Start / resume to continue an interrupted scan, or Refresh for new prices.")
     refresh_requested=st.button("🔄 Refresh market data",use_container_width=True)
-    strategy=st.selectbox("Strategy",["EMA200 recovery → all-time-high breakout","Stage 2 only","Momentum ranking"])
-    recovery_mode=strategy.startswith("EMA200 recovery")
+    strategy=st.selectbox("Strategy",["EMA200 + Stage 2","EMA200 only","Stage 2 only","Momentum ranking"])
+    recovery_mode=strategy in ["EMA200 + Stage 2","EMA200 only"]
     recovery_only=st.checkbox("Show recovery BUY / HOLD / EXIT signals only",True) if recovery_mode else False
     if recovery_mode: st.caption("Below EMA200 within the previous 6 calendar months, then a fresh intraday all-time high. Model exit when daily low touches EMA200. RSI and volume are informational only. Current-session signals are provisional; HOLD/EXIT refer to model positions, not your actual holdings.")
-    only_stage2=True if strategy=="Stage 2 only" else st.checkbox("Require Stage 2 — must also pass (AND)",False,key="require_stage2")
+    only_stage2=strategy in ["EMA200 + Stage 2","Stage 2 only"]
+    st.caption({"EMA200 + Stage 2":"Both required: recovery BUY/HOLD signal AND your Chartink Stage-2 filter.",
+                "EMA200 only":"EMA200 recovery-to-all-time-high strategy; no Stage-2 requirement.",
+                "Stage 2 only":"Your Chartink SMA trend filter; no EMA200 recovery requirement.",
+                "Momentum ranking":"Original custom score across the universe; no required recovery or Stage-2 filter."}[strategy])
     if recovery_mode and only_stage2:
         st.caption("Combined filter: show only recovery BUY/HOLD signals that also pass Stage 2. WAIT, EXIT and AMBIGUOUS rows are excluded.")
     st.caption("Stage 2 uses your SMA50/150/200 template, rising SMA200 over 20 OR 80 OR 100 sessions, weekly 52-week extremes, price >10 and price × average 50-day volume >1,000,000. Global markets use their quoted price units.")
@@ -313,7 +317,7 @@ if strategy=="Momentum ranking" and (market.startswith("USA") or market=="Global
     st.dataframe(usa_show,use_container_width=True,hide_index=True)
     st.caption("RS columns = stock return minus S&P 500 return over the same period. Ranking is systematic, not a buy recommendation.")
 
-st.subheader(f"🔥 {market} — {strategy}" + (" + Stage 2 (AND)" if recovery_mode and only_stage2 else ""))
+st.subheader(f"🔥 {market} — {strategy}")
 cols=["Country","Ticker","Company","Sector","Currency","Price","Data Date","Global Momentum Score","Action","Stage 2","% From 52W High","RSI14","Rel Volume","Return 3M %","Return 6M %","Return 12M %","RS 3M %","RS 6M %","RS 12M %","SMA50","SMA150","SMA200","SMA200 Rising","EMA20","EMA50","EMA100","EMA150","EMA200"]
 if recovery_mode:
     cols=["Country","Ticker","Company","Currency","Price","Recovery Signal","Stage 2","Below EMA200 in 6M","Prior All-Time High","Recovery EMA200","Distance to EMA200 %","Model Entry Date","Data Date","History From"]
