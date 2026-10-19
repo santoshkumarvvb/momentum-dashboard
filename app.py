@@ -30,7 +30,9 @@ with st.sidebar:
     recovery_mode=strategy.startswith("EMA200 recovery")
     recovery_only=st.checkbox("Show recovery BUY / HOLD / EXIT signals only",True) if recovery_mode else False
     if recovery_mode: st.caption("Below EMA200 within the previous 6 calendar months, then a fresh intraday all-time high. Model exit when daily low touches EMA200. RSI and volume are informational only. Current-session signals are provisional; HOLD/EXIT refer to model positions, not your actual holdings.")
-    only_stage2=True if strategy=="Stage 2 only" else st.checkbox("Require Stage 2",False)
+    only_stage2=True if strategy=="Stage 2 only" else st.checkbox("Require Stage 2 — must also pass (AND)",False,key="require_stage2")
+    if recovery_mode and only_stage2:
+        st.caption("Combined filter: show only recovery BUY/HOLD signals that also pass Stage 2. WAIT, EXIT and AMBIGUOUS rows are excluded.")
     st.caption("Stage 2 uses your SMA50/150/200 template, rising SMA200 over 20 OR 80 OR 100 sessions, weekly 52-week extremes, price >10 and price × average 50-day volume >1,000,000. Global markets use their quoted price units.")
     high_filter=st.selectbox("52-week-high filter",["All","Within 25%","Within 10%","Within 5%","Within 2%"])
     min_rsi=st.slider("Minimum RSI(14)",0,80,0,5)
@@ -284,8 +286,12 @@ if recovery_mode:
     df["Stage 2 Action"]=df["Action"]
     df["Action"]=df["Recovery Signal"]
 all_df=df.copy()
-if recovery_mode and recovery_only:df=df[df["Recovery Signal"].isin(["BUY","HOLD","EXIT","AMBIGUOUS"])]
-if only_stage2:df=df[df["Stage 2"]]
+if recovery_mode and only_stage2:
+    df=df[df["Stage 2"].eq(True) & df["Recovery Signal"].isin(["BUY","HOLD"])]
+elif recovery_mode and recovery_only:
+    df=df[df["Recovery Signal"].isin(["BUY","HOLD","EXIT","AMBIGUOUS"])]
+elif only_stage2:
+    df=df[df["Stage 2"].eq(True)]
 fm={"Within 25%":"Within 25%","Within 10%":"Within 10%","Within 5%":"Within 5%","Within 2%":"Within 2%"}
 if high_filter in fm:df=df[df[fm[high_filter]]]
 if min_rsi:df=df[df["RSI14"]>=min_rsi]
@@ -294,11 +300,12 @@ df=df.sort_values(["Global Momentum Score","RS 6M %","% From 52W High"],ascendin
 
 if recovery_mode:
     df=df.assign(_order=df["Recovery Signal"].map({"BUY":0,"HOLD":1,"EXIT":2,"AMBIGUOUS":3,"WAIT":4})).sort_values(["_order","Distance to EMA200 %"]).drop(columns="_order").reset_index(drop=True)
-c1,c2,c3,c4,c5=st.columns(5);c1.metric("Stocks scanned",len(all_df));c2.metric("Stage 2",int(all_df["Stage 2"].sum()));c3.metric("Within 5%",int(all_df["Within 5%"].sum()));c4.metric("Within 2%",int(all_df["Within 2%"].sum()));c5.metric("New recovery entries" if recovery_mode else "Breakouts",int((all_df["Action"]==("BUY" if recovery_mode else "BREAKOUT")).sum()))
+st.caption(f"Showing {len(df):,} matches from {len(all_df):,} stocks with usable data. Counters below follow all selected filters.")
+c1,c2,c3,c4,c5=st.columns(5);c1.metric("Matching stocks",len(df));c2.metric("Stage 2",int(df["Stage 2"].sum()));c3.metric("Within 5%",int(df["Within 5%"].sum()));c4.metric("Within 2%",int(df["Within 2%"].sum()));c5.metric("New recovery entries" if recovery_mode else "Breakouts",int((df["Action"]==("BUY" if recovery_mode else "BREAKOUT")).sum()))
 
 if strategy=="Momentum ranking" and (market.startswith("USA") or market=="Global"):
     st.subheader("🇺🇸 Top USA Momentum")
-    usa=all_df[all_df["Country"]=="USA"].sort_values(["Global Momentum Score","RS 6M %"],ascending=False).head(20)
+    usa=df[df["Country"]=="USA"].sort_values(["Global Momentum Score","RS 6M %"],ascending=False).head(20)
     usa_cols=["Ticker","Company","Sector","Price","Global Momentum Score","Action","Stage 2","% From 52W High","RSI14","Rel Volume","Return 3M %","Return 6M %","Return 12M %","RS 3M %","RS 6M %","RS 12M %"]
     usa_show=usa[usa_cols].copy()
     for c in usa_show.columns:
@@ -306,10 +313,10 @@ if strategy=="Momentum ranking" and (market.startswith("USA") or market=="Global
     st.dataframe(usa_show,use_container_width=True,hide_index=True)
     st.caption("RS columns = stock return minus S&P 500 return over the same period. Ranking is systematic, not a buy recommendation.")
 
-st.subheader(f"🔥 {market} — {strategy}")
+st.subheader(f"🔥 {market} — {strategy}" + (" + Stage 2 (AND)" if recovery_mode and only_stage2 else ""))
 cols=["Country","Ticker","Company","Sector","Currency","Price","Data Date","Global Momentum Score","Action","Stage 2","% From 52W High","RSI14","Rel Volume","Return 3M %","Return 6M %","Return 12M %","RS 3M %","RS 6M %","RS 12M %","SMA50","SMA150","SMA200","SMA200 Rising","EMA20","EMA50","EMA100","EMA150","EMA200"]
 if recovery_mode:
-    cols=["Country","Ticker","Company","Currency","Price","Recovery Signal","Below EMA200 in 6M","Prior All-Time High","Recovery EMA200","Distance to EMA200 %","Model Entry Date","Data Date","History From"]
+    cols=["Country","Ticker","Company","Currency","Price","Recovery Signal","Stage 2","Below EMA200 in 6M","Prior All-Time High","Recovery EMA200","Distance to EMA200 %","Model Entry Date","Data Date","History From"]
     st.caption("ATH means highest intraday high in all available Yahoo history, excluding the current bar. The recovery test uses a daily close below EMA200 within 6 calendar months before entry. Prices are split-adjusted by Yahoo; missing early history can affect ATH. Model signals are not actual holdings or trade fills. The old momentum score does not control this strategy.")
 show=df[cols].copy()
 for c in show.columns:
